@@ -138,17 +138,17 @@ function ghostMessage(messageIndex) {
     if (!msg.extra) msg.extra = {};
     if (msg.extra.sc_ghosted) return;
 
-    // Persistent flag (our tracking)
+    // Our persistent tracking flag
     msg.extra.sc_ghosted = true;
 
-    // Method 1: is_system flag (works on many ST versions)
-    msg.is_system = true;
+    // SillyTavern's native hidden flag — excludes from context building
+    // This is what /hide command sets internally
+    msg.is_hidden = true;
 
-    // Method 2: CSS class for visual indicator
+    // Visual indicator
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageIndex}"]`);
     if (messageElement) {
         messageElement.classList.add('sc-ghosted');
-        messageElement.setAttribute('is_system', 'true');
     }
 
     log(`Ghosted message at index ${messageIndex}`);
@@ -159,17 +159,14 @@ function unghostMessage(messageIndex) {
     const msg = chat[messageIndex];
     if (!msg) return;
 
-    // Clear our tracking flag
     if (msg.extra) delete msg.extra.sc_ghosted;
 
-    // Restore is_system
-    msg.is_system = false;
+    // Remove the hidden flag
+    msg.is_hidden = false;
 
-    // Clear visuals
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageIndex}"]`);
     if (messageElement) {
         messageElement.classList.remove('sc-ghosted');
-        messageElement.setAttribute('is_system', 'false');
     }
 
     log(`Unghosted message at index ${messageIndex}`);
@@ -194,17 +191,16 @@ function applyGhostVisuals() {
         if (!chat) return;
         for (let i = 0; i < chat.length; i++) {
             const isGhosted = chat[i]?.extra?.sc_ghosted === true;
-            const messageElement = document.querySelector(`#chat .mes[mesid="${i}"]`);
 
-            // Re-apply is_system on load (in case chat was reloaded from file)
+            // Re-apply is_hidden on load in case chat was reloaded
             if (isGhosted) {
-                chat[i].is_system = true;
+                chat[i].is_hidden = true;
             }
 
+            const messageElement = document.querySelector(`#chat .mes[mesid="${i}"]`);
             if (!messageElement) continue;
             if (isGhosted) {
                 messageElement.classList.add('sc-ghosted');
-                messageElement.setAttribute('is_system', 'true');
             } else {
                 messageElement.classList.remove('sc-ghosted');
             }
