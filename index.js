@@ -1,7 +1,7 @@
 /**
- * Summaryception v3.3 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v4.0 — Layered Recursive Summarization for SillyTavern
  *
- * NON-DESTRUCTIVE: Uses message extra flags and generation interceptor
+ * NON-DESTRUCTIVE: Uses SillyTavern's native /hide and /unhide commands
  * to exclude summarized messages from LLM context while keeping them
  * fully visible and readable in the chat UI.
  *
@@ -129,7 +129,7 @@ function getPlayerName() {
     return ctx.name1 || 'User';
 }
 
-// ─── Message Hiding (Ghosting) ───────────────────────────────────────
+// ─── Message Hiding (Ghosting via native /hide /unhide) ──────────────
 
 async function ghostMessage(messageIndex) {
     const { chat } = SillyTavern.getContext();
@@ -138,10 +138,8 @@ async function ghostMessage(messageIndex) {
     if (!msg.extra) msg.extra = {};
     if (msg.extra.sc_ghosted) return;
 
-    // Track that WE ghosted this
     msg.extra.sc_ghosted = true;
 
-    // Use SillyTavern's native hide
     await SillyTavern.getContext().executeSlashCommandsWithOptions(`/hide ${messageIndex}`);
 
     log(`Ghosted message at index ${messageIndex}`);
@@ -153,7 +151,6 @@ async function unghostMessage(messageIndex) {
     if (!msg) return;
     if (msg.extra) delete msg.extra.sc_ghosted;
 
-    // Use SillyTavern's native unhide
     await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${messageIndex}`);
 
     log(`Unghosted message at index ${messageIndex}`);
@@ -161,14 +158,40 @@ async function unghostMessage(messageIndex) {
 
 async function ghostMessagesUpTo(endIndex) {
     const { chat } = SillyTavern.getContext();
-    for (let i = 0; i <= endIndex; i++) {
+
+    // Mark all our messages first
+    for (let i = 1; i <= endIndex; i++) {
         const msg = chat[i];
         if (!msg) continue;
-        if (i === 0) continue;
         if (msg.is_system && !msg.extra?.sc_ghosted) continue;
-        await ghostMessage(i);
+        if (!msg.extra) msg.extra = {};
+        msg.extra.sc_ghosted = true;
     }
+
+    // Use range hide for efficiency
+    await SillyTavern.getContext().executeSlashCommandsWithOptions(`/hide 1-${endIndex}`);
+
     log(`Ghosted messages from index 1 to ${endIndex}`);
+}
+
+async function unghostAllMessages() {
+    const { chat } = SillyTavern.getContext();
+
+    let minIdx = -1;
+    let maxIdx = -1;
+    for (let i = 0; i < chat.length; i++) {
+        if (chat[i]?.extra?.sc_ghosted) {
+            if (minIdx === -1) minIdx = i;
+            maxIdx = i;
+            delete chat[i].extra.sc_ghosted;
+        }
+    }
+
+    if (minIdx === -1) return;
+
+    await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${minIdx}-${maxIdx}`);
+
+    log(`Unghosted all messages from ${minIdx} to ${maxIdx}`);
 }
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
@@ -222,13 +245,12 @@ function snapshotPromptToggles() {
         }
         const collection = promptManager.getPromptCollection();
         if (!collection?.collection) return snapshot;
+        const orderList = promptManager.getPromptOrderEntries();
+        if (!orderList) return snapshot;
         for (const entry of collection.collection) {
-            const orderList = promptManager.getPromptOrderEntries();
-            if (orderList) {
-                for (const orderEntry of orderList) {
-                    if (orderEntry.identifier === entry.identifier) {
-                        snapshot.set(entry.identifier, orderEntry.enabled);
-                    }
+            for (const orderEntry of orderList) {
+                if (orderEntry.identifier === entry.identifier) {
+                    snapshot.set(entry.identifier, orderEntry.enabled);
                 }
             }
         }
@@ -406,7 +428,6 @@ async function maybeSummarizeTurns() {
         log(`Large backlog detected: ${overflow} turns over limit`);
 
         const batchesNeeded = Math.ceil(overflow / s.turnsPerSummary);
-
         const choice = await showCatchupDialog(overflow, batchesNeeded);
 
         if (choice === 'skip') {
@@ -418,16 +439,13 @@ async function maybeSummarizeTurns() {
             catchupDismissed = true;
             await saveChatStore();
             return;
-
         } else if (choice === 'catchup') {
             await runCatchup(visibleTurns, overflow);
             return;
-
         } else if (choice === 'partial') {
             await summarizeOneBatch(visibleTurns);
             return;
         }
-
         return;
     }
 
@@ -486,7 +504,7 @@ async function summarizeOneBatch(visibleTurns) {
         });
 
         store.summarizedUpTo = Math.max(store.summarizedUpTo, endIdx);
-        ghostMessagesUpTo(endIdx);
+        await ghostMessagesUpTo(endIdx);
 
         log(`Layer 0 now has ${store.layers[0].length} snippets`);
 
@@ -543,7 +561,7 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
     });
 
     store.summarizedUpTo = Math.max(store.summarizedUpTo, endIdx);
-    ghostMessagesUpTo(endIdx);
+    await ghostMessagesUpTo(endIdx);
 
     await maybePromoteLayer(0);
     await saveChatStore();
@@ -861,7 +879,6 @@ function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
     setTimeout(() => {
-        applyGhostVisuals();
         updateInjection();
         updateUI();
     }, 100);
@@ -907,12 +924,7 @@ function registerSlashCommands() {
             name: 'sc-clear',
             callback: async () => {
                 const store = getChatStore();
-                const { chat } = SillyTavern.getContext();
-                for (let i = 0; i < chat.length; i++) {
-                    if (chat[i]?.extra?.sc_ghosted) {
-                        unghostMessage(i);
-                    }
-                }
+                await unghostAllMessages();
                 store.layers = [];
                 store.summarizedUpTo = -1;
                 await saveChatStore();
@@ -1097,12 +1109,7 @@ function bindUIEvents() {
     $('#sc_clear_memory').on('click', async function () {
         if (!confirm('Clear ALL Summaryception memory for this chat and unghost all messages?')) return;
         const store = getChatStore();
-        const { chat } = SillyTavern.getContext();
-        for (let i = 0; i < chat.length; i++) {
-            if (chat[i]?.extra?.sc_ghosted) {
-                unghostMessage(i);
-            }
-        }
+        await unghostAllMessages();
         store.layers = [];
         store.summarizedUpTo = -1;
         await saveChatStore();
@@ -1129,10 +1136,8 @@ function bindUIEvents() {
         }
         $(this).prop('disabled', true).text(' Working…');
         try {
-            // Reset catchup dismissed so dialog can show
             catchupDismissed = false;
 
-            // Force: bypass normal trigger, directly check and process
             const { chat } = SillyTavern.getContext();
             const allAssistantTurns = getAssistantTurns(chat);
             const visibleTurns = allAssistantTurns.filter(t => t.index > 0 && !chat[t.index].extra?.sc_ghosted);
@@ -1145,7 +1150,6 @@ function bindUIEvents() {
             const overflow = visibleTurns.length - s.verbatimTurns;
             toastr.info(`${overflow} turns to process. Starting...`, 'Summaryception', { timeOut: 2000 });
 
-            // Run catchup directly
             await runCatchup(visibleTurns, overflow);
             updateInjection();
         } finally {
@@ -1187,11 +1191,7 @@ function bindUIEvents() {
                 const store = getChatStore();
 
                 // Unghost everything first
-                for (let i = 0; i < chat.length; i++) {
-                    if (chat[i]?.extra?.sc_ghosted) {
-                        unghostMessage(i);
-                    }
-                }
+                await unghostAllMessages();
 
                 // Load imported data
                 store.layers = data.layers;
@@ -1199,7 +1199,7 @@ function bindUIEvents() {
 
                 // Re-ghost up to imported pointer
                 if (store.summarizedUpTo >= 0) {
-                    ghostMessagesUpTo(store.summarizedUpTo);
+                    await ghostMessagesUpTo(store.summarizedUpTo);
                 }
 
                 await saveChatStore();
@@ -1249,14 +1249,11 @@ function bindUIEvents() {
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
     eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
 
-    setupGenerationInterceptor();
     registerSlashCommands();
 
     eventSource.on(event_types.APP_READY, () => {
-        setupGhostObserver();
-        applyGhostVisuals();
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v3.3 loaded. Ghost mode — non-destructive layered summarization.');
+        console.log(LOG_PREFIX, 'v4.0 loaded. Using native /hide /unhide for context exclusion.');
     });
 })();

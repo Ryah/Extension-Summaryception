@@ -180,25 +180,6 @@
     opacity: 1;
 }
 
-/* ─── Ghost Visual Indicator ──────────────────────────────────── */
-
-.sc-ghosted {
-    opacity: 0.45;
-    position: relative;
-    border-left: 3px solid rgba(255, 255, 255, 0.15);
-}
-
-.sc-ghosted::after {
-    content: '👻';
-    position: absolute;
-    top: 8px;
-    right: 12px;
-    font-size: 1.1em;
-    z-index: 10;
-    opacity: 0.8;
-    pointer-events: none;
-}
-
 /* ─── Catch-Up Dialog ─────────────────────────────────────────── */
 
 .sc-catchup-overlay {
