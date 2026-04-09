@@ -161,26 +161,62 @@ async function ghostMessage(messageIndex) {
 async function unghostAllMessages() {
     const { chat } = SillyTavern.getContext();
 
+    // Count ghosted messages
+    let ghostedCount = 0;
     for (let i = 0; i < chat.length; i++) {
         if (chat[i]?.extra?.sc_ghosted) {
+            ghostedCount++;
             delete chat[i].extra.sc_ghosted;
         }
     }
 
+    if (ghostedCount === 0) return;
+
+    const progressToast = toastr.info(
+        `Unhiding messages: 0 / ${chat.length}`,
+        'Summaryception — Clearing',
+        {
+            timeOut: 0,
+            extendedTimeOut: 0,
+            tapToDismiss: false,
+        }
+    );
+
+    let processed = 0;
     for (let i = 0; i < chat.length; i++) {
         try {
             await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
         } catch (e) {
             log(`Failed to unhide message ${i}:`, e);
         }
+
+        processed++;
+        if (processed % 10 === 0) {
+            const pct = Math.round((processed / chat.length) * 100);
+            $(progressToast).find('.toast-message').text(
+                `Unhiding messages: ${processed} / ${chat.length} (${pct}%)`
+            );
+        }
     }
 
+    toastr.clear(progressToast);
     log(`Unghosted all ${chat.length} messages`);
 }
 
 async function ghostMessagesUpTo(endIndex) {
     const { chat } = SillyTavern.getContext();
 
+    const progressToast = toastr.info(
+        `Hiding messages: 0 / ${endIndex}`,
+        'Summaryception — Ghosting',
+        {
+            timeOut: 0,
+            extendedTimeOut: 0,
+            tapToDismiss: false,
+        }
+    );
+
+    let processed = 0;
     for (let i = 1; i <= endIndex; i++) {
         const msg = chat[i];
         if (!msg) continue;
@@ -195,8 +231,17 @@ async function ghostMessagesUpTo(endIndex) {
         } catch (e) {
             log(`Failed to hide message ${i}:`, e);
         }
+
+        processed++;
+        if (processed % 10 === 0) {
+            const pct = Math.round((i / endIndex) * 100);
+            $(progressToast).find('.toast-message').text(
+                `Hiding messages: ${i} / ${endIndex} (${pct}%)`
+            );
+        }
     }
 
+    toastr.clear(progressToast);
     log(`Ghosted messages from index 1 to ${endIndex}`);
 }
 
