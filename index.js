@@ -1,5 +1,5 @@
 /**
- * Summaryception v5.0 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v5.1.4 — Layered Recursive Summarization for SillyTavern
  *
  * NON-DESTRUCTIVE: Uses SillyTavern's native /hide and /unhide commands
  * to exclude summarized messages from LLM context while keeping them
@@ -1222,9 +1222,15 @@ function updateSnippetBrowser() {
                 ? `merged ${sn.mergedCount} from L${sn.fromLayer}`
                 : '';
                 const seedStr = sn.promoted ? ' 🌱' : '';
+                const canRedo = (i === 0 && sn.turnRange);
+                const redoBtn = canRedo
+                ? `<button class="sc-snippet-redo menu_button fa-solid fa-rotate-right" title="Regenerate this snippet"></button>`
+                : '';
+
                 html += `<div class="sc-snippet" data-layer="${i}" data-idx="${j}">
                 <span class="sc-snippet-text" data-layer="${i}" data-idx="${j}" title="Click to edit">${escapeHtml(sn.text)}</span>
                 <span class="sc-snippet-meta">${rangeStr}${seedStr}</span>
+                ${redoBtn}
                 <button class="sc-snippet-delete menu_button fa-solid fa-xmark" title="Delete this snippet"></button>
                 </div>`;
             }
@@ -1275,6 +1281,92 @@ function updateSnippetBrowser() {
 
         textEl.replaceWith(textarea);
         textarea.focus().select();
+    });
+
+    // Redo snippet
+    $('.sc-snippet-redo').off('click').on('click', async function () {
+        const layerIdx = parseInt($(this).closest('.sc-snippet').data('layer'));
+        const snippetIdx = parseInt($(this).closest('.sc-snippet').data('idx'));
+        const store = getChatStore();
+        const layer = store.layers[layerIdx];
+        if (!layer || !layer[snippetIdx]) return;
+
+        const sn = layer[snippetIdx];
+
+        // Only Layer 0 snippets have turnRange — promoted snippets can't be redone
+        if (!sn.turnRange) {
+            toastr.warning(
+                'Only Layer 0 (turn summary) snippets can be regenerated. Promoted meta-summaries have no source turns.',
+                           'Summaryception',
+                           { timeOut: 5000 }
+            );
+            return;
+        }
+
+        if (isSummarizing) {
+            toastr.warning('Already summarizing. Please wait.', 'Summaryception');
+            return;
+        }
+
+        const [rangeStart, rangeEnd] = sn.turnRange;
+        const { chat } = SillyTavern.getContext();
+
+        // Confirm
+        if (!confirm(`Regenerate summary for turns ${rangeStart}–${rangeEnd}?`)) return;
+
+        isSummarizing = true;
+        const btn = $(this);
+        btn.prop('disabled', true).removeClass('fa-rotate-right').addClass('fa-spinner fa-spin');
+
+        try {
+            // Build passage from the original turn range
+            const storyTxt = buildPassageFromRange(chat, rangeStart, rangeEnd);
+
+            if (!storyTxt.trim()) {
+                toastr.error('Source turns are empty — cannot regenerate.', 'Summaryception');
+                return;
+            }
+
+            // Build context from everything EXCEPT this snippet
+            const contextParts = [];
+            for (let i = store.layers.length - 1; i >= 0; i--) {
+                const l = store.layers[i];
+                if (!l) continue;
+                for (let j = 0; j < l.length; j++) {
+                    // Skip the snippet we're regenerating
+                    if (i === layerIdx && j === snippetIdx) continue;
+                    contextParts.push(l[j].text);
+                }
+            }
+            const contextStr = contextParts.length > 0 ? contextParts.join(' ') : '(none yet)';
+
+            toastr.info(`Regenerating summary for turns ${rangeStart}–${rangeEnd}…`, 'Summaryception', {
+                timeOut: 3000,
+                progressBar: true,
+            });
+
+            const newSummary = await callSummarizer(storyTxt, contextStr);
+
+            if (!newSummary) {
+                toastr.error('Regeneration failed — original snippet kept.', 'Summaryception');
+                return;
+            }
+
+            // Replace in place
+            sn.text = newSummary;
+            sn.timestamp = Date.now();
+            sn.regenerated = true;
+
+            await saveChatStore();
+            updateInjection();
+            updateUI();
+
+            toastr.success(`Snippet regenerated for turns ${rangeStart}–${rangeEnd}`, 'Summaryception', { timeOut: 3000 });
+
+        } finally {
+            isSummarizing = false;
+            btn.prop('disabled', false).removeClass('fa-spinner fa-spin').addClass('fa-rotate-right');
+        }
     });
 
     // Delete snippet
@@ -1830,6 +1922,6 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     eventSource.on(event_types.APP_READY, () => {
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v5.1.3 loaded. Connection Settings available');
+        console.log(LOG_PREFIX, 'v5.1.4 loaded. Connection Settings available');
     });
 })();

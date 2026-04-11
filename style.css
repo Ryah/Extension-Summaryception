@@ -302,6 +302,20 @@
     outline: none;
 }
 
+.sc-snippet-redo {
+    color: var(--SmartThemeQuoteColor, #8fc8ff);
+    cursor: pointer;
+    opacity: 0.6;
+    transition: opacity 0.15s;
+    font-size: 0.85em;
+    background: none;
+    border: none;
+    padding: 2px 4px;
+}
+
+.sc-snippet-redo:hover {
+    opacity: 1;
+}
 /* ═══════════════════════════════════════════════════════════
  *  Summaryception — Connection Settings Styles
  *  ═══════════════════════════════════════════════════════════ */
