@@ -238,7 +238,7 @@ async function ghostMessagesUpTo(endIndex) {
     const { chat } = SillyTavern.getContext();
 
     const progressToast = toastr.info(
-        `Hiding messages: 0 / ${endIndex}`,
+        `Hiding messages: 0 / ${endIndex + 1}`,
         'Summaryception — Ghosting',
         {
             timeOut: 0,
@@ -248,7 +248,7 @@ async function ghostMessagesUpTo(endIndex) {
     );
 
     let processed = 0;
-    for (let i = 1; i <= endIndex; i++) {
+    for (let i = 0; i <= endIndex; i++) {
         const msg = chat[i];
         if (!msg) continue;
         if (msg.is_system && !msg.extra?.sc_ghosted) continue;
@@ -265,15 +265,15 @@ async function ghostMessagesUpTo(endIndex) {
 
         processed++;
         if (processed % 10 === 0) {
-            const pct = Math.round((i / endIndex) * 100);
+            const pct = Math.round((i / (endIndex + 1)) * 100);
             $(progressToast).find('.toast-message').text(
-                `Hiding messages: ${i} / ${endIndex} (${pct}%)`
+                `Hiding messages: ${i} / ${endIndex + 1} (${pct}%)`
             );
         }
     }
 
     toastr.clear(progressToast);
-    log(`Ghosted messages from index 1 to ${endIndex}`);
+    log(`Ghosted messages from index 0 to ${endIndex}`);
 }
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
@@ -609,7 +609,7 @@ async function maybeSummarizeTurns() {
     const store = getChatStore();
 
     const allAssistantTurns = getAssistantTurns(chat);
-    const visibleTurns = allAssistantTurns.filter(t => t.index > 0 && !chat[t.index].extra?.sc_ghosted);
+    const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
 
     log(`Visible assistant turns (excluding turn 0): ${visibleTurns.length}, limit: ${s.verbatimTurns}`);
 
@@ -685,9 +685,7 @@ async function summarizeOneBatch(visibleTurns) {
         log(`Summarizing ${batch.length} assistant turns (indices ${startIdx}–${endIdx})`);
 
         if (!store.layers[0]) store.layers[0] = [];
-        const passageStart = (store.layers[0].length === 0) ? 0 : store.summarizedUpTo + 1;
-        if (passageStart === 0) {
-            log('First summary — including messages 0-1 in passage');
+        const passageStart = store.summarizedUpTo < 0 ? 0 : store.summarizedUpTo + 1;
         }
 
         const storyTxt = buildPassageFromRange(chat, passageStart, endIdx);
@@ -752,9 +750,7 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
     const endIdx = batch[batch.length - 1].index;
 
     if (!store.layers[0]) store.layers[0] = [];
-    const passageStart = (store.layers[0].length === 0) ? 0 : store.summarizedUpTo + 1;
-    if (passageStart === 0) {
-        log('First summary — including messages 0-1 in passage');
+    const passageStart = store.summarizedUpTo < 0 ? 0 : store.summarizedUpTo + 1;
     }
 
     const storyTxt = buildPassageFromRange(chat, passageStart, endIdx);
@@ -824,7 +820,7 @@ async function runCatchup(visibleTurns, overflow) {
         while (!cancelled) {
             const { chat } = SillyTavern.getContext();
             const allAssistantTurns = getAssistantTurns(chat);
-            const currentVisible = allAssistantTurns.filter(t => t.index > 0 && !chat[t.index].extra?.sc_ghosted);
+            const currentVisible = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
 
             if (currentVisible.length <= s.verbatimTurns) break;
 
@@ -1596,7 +1592,7 @@ function bindUIEvents() {
 
             const { chat } = SillyTavern.getContext();
             const allAssistantTurns = getAssistantTurns(chat);
-            const visibleTurns = allAssistantTurns.filter(t => t.index > 0 && !chat[t.index].extra?.sc_ghosted);
+            const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
 
             if (visibleTurns.length <= s.verbatimTurns) {
                 toastr.info('Nothing to summarize — visible turns are within the verbatim limit.', 'Summaryception');
