@@ -1,5 +1,5 @@
 /**
- * Summaryception v5.1.7 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v5.2.0 — Layered Recursive Summarization for SillyTavern
  *
  * NON-DESTRUCTIVE: Uses SillyTavern's native /hide and /unhide commands
  * to exclude summarized messages from LLM context while keeping them
@@ -67,6 +67,7 @@ const defaultSettings = Object.freeze({
     openaiUrl: '',
     openaiKey: '',
     openaiModel: '',
+    openaiMaxTokens: 0,                   // 0 = no limit (provider default)
 });
 
 // ─── Retry Configuration ─────────────────────────────────────────────
@@ -103,9 +104,6 @@ function isRetryableError(error) {
     if (error?.name === 'AbortError') return false;
 
     // ConnectionError from connectionutil.js carries an explicit retryable flag.
-    // This prevents burning retries on config/auth errors (missing model, bad API key,
-    // deleted profile, missing URL) that will never succeed no matter how many times
-    // we retry. Uses duck-typing on .name to avoid needing to import the class.
     if (error?.name === 'ConnectionError' && typeof error.retryable === 'boolean') {
         return error.retryable;
     }
@@ -155,7 +153,12 @@ function getChatStore() {
         chatMetadata[MODULE_NAME] = {
             layers: [],
             summarizedUpTo: -1,
+            ghostedIndices: [],           // Track which messages WE ghosted
         };
+    }
+    // Migration: add ghostedIndices if missing from older saves
+    if (!chatMetadata[MODULE_NAME].ghostedIndices) {
+        chatMetadata[MODULE_NAME].ghostedIndices = [];
     }
     return chatMetadata[MODULE_NAME];
 }
@@ -180,6 +183,12 @@ async function ghostMessage(messageIndex) {
 
     msg.extra.sc_ghosted = true;
 
+    // Track that WE ghosted this message
+    const store = getChatStore();
+    if (!store.ghostedIndices.includes(messageIndex)) {
+        store.ghostedIndices.push(messageIndex);
+    }
+
     try {
         await SillyTavern.getContext().executeSlashCommandsWithOptions(`/hide ${messageIndex}`, { showOutput: false });
     } catch (e) {
@@ -191,20 +200,27 @@ async function ghostMessage(messageIndex) {
 
 async function unghostAllMessages() {
     const { chat } = SillyTavern.getContext();
+    const store = getChatStore();
 
-    // Count ghosted messages
-    let ghostedCount = 0;
-    for (let i = 0; i < chat.length; i++) {
-        if (chat[i]?.extra?.sc_ghosted) {
-            ghostedCount++;
-            delete chat[i].extra.sc_ghosted;
+    // Only unhide messages that WE ghosted, not user-hidden messages
+    const toUnhide = store.ghostedIndices && store.ghostedIndices.length > 0
+    ? [...store.ghostedIndices]
+    : [];
+
+    // Fallback for older saves that don't have ghostedIndices:
+    // find messages with our sc_ghosted flag
+    if (toUnhide.length === 0) {
+        for (let i = 0; i < chat.length; i++) {
+            if (chat[i]?.extra?.sc_ghosted) {
+                toUnhide.push(i);
+            }
         }
     }
 
-    if (ghostedCount === 0) return;
+    if (toUnhide.length === 0) return;
 
     const progressToast = toastr.info(
-        `Unhiding messages: 0 / ${chat.length}`,
+        `Unhiding messages: 0 / ${toUnhide.length}`,
         'Summaryception — Clearing',
         {
             timeOut: 0,
@@ -214,28 +230,39 @@ async function unghostAllMessages() {
     );
 
     let processed = 0;
-    for (let i = 0; i < chat.length; i++) {
-        try {
-            await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
-        } catch (e) {
-            log(`Failed to unhide message ${i}:`, e);
+    for (const idx of toUnhide) {
+        if (idx >= 0 && idx < chat.length) {
+            // Clear our ghost flag
+            if (chat[idx]?.extra?.sc_ghosted) {
+                delete chat[idx].extra.sc_ghosted;
+            }
+
+            try {
+                await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${idx}`, { showOutput: false });
+            } catch (e) {
+                log(`Failed to unhide message ${idx}:`, e);
+            }
         }
 
         processed++;
         if (processed % 10 === 0) {
-            const pct = Math.round((processed / chat.length) * 100);
+            const pct = Math.round((processed / toUnhide.length) * 100);
             $(progressToast).find('.toast-message').text(
-                `Unhiding messages: ${processed} / ${chat.length} (${pct}%)`
+                `Unhiding messages: ${processed} / ${toUnhide.length} (${pct}%)`
             );
         }
     }
 
+    // Clear the tracking array
+    store.ghostedIndices = [];
+
     toastr.clear(progressToast);
-    log(`Unghosted all ${chat.length} messages`);
+    log(`Unghosted ${toUnhide.length} messages (only Summaryception-hidden ones)`);
 }
 
 async function ghostMessagesUpTo(endIndex) {
     const { chat } = SillyTavern.getContext();
+    const store = getChatStore();
 
     const progressToast = toastr.info(
         `Hiding messages: 0 / ${endIndex + 1}`,
@@ -255,7 +282,19 @@ async function ghostMessagesUpTo(endIndex) {
         if (!msg.extra) msg.extra = {};
         if (msg.extra.sc_ghosted) continue;
 
+        // Check if the message is already hidden by the user (not by us)
+        // If so, skip it — don't claim ownership of a user-hidden message
+        if (msg.is_hidden) {
+            log(`Skipping message ${i} — already hidden by user`);
+            continue;
+        }
+
         msg.extra.sc_ghosted = true;
+
+        // Track that WE ghosted this message
+        if (!store.ghostedIndices.includes(i)) {
+            store.ghostedIndices.push(i);
+        }
 
         try {
             await SillyTavern.getContext().executeSlashCommandsWithOptions(`/hide ${i}`, { showOutput: false });
@@ -302,14 +341,26 @@ function getVisibleAssistantTurns(chat) {
     return turns;
 }
 
+/**
+ * Build passage text from a range of chat messages.
+ * Skips messages that are hidden (by user or system) UNLESS they were
+ * hidden by Summaryception (sc_ghosted). Also skips empty messages.
+ */
 function buildPassageFromRange(chat, startIdx, endIdx) {
     const lines = [];
     for (let i = startIdx; i <= endIdx; i++) {
         const m = chat[i];
-        if (m && m.mes && m.mes.trim()) {
-            const speaker = m.is_user ? 'Player' : 'Assistant';
-            lines.push(`${speaker}: ${m.mes.trim()}`);
-        }
+        if (!m) continue;
+        if (!m.mes || !m.mes.trim()) continue;
+
+        // Skip messages hidden by the user (not by us)
+        // A message hidden by the user will be is_system/is_hidden but NOT sc_ghosted
+        // A message hidden by us will have sc_ghosted = true
+        const isUserHidden = (m.is_system || m.is_hidden) && !m.extra?.sc_ghosted;
+        if (isUserHidden) continue;
+
+        const speaker = m.is_user ? 'Player' : 'Assistant';
+        lines.push(`${speaker}: ${m.mes.trim()}`);
     }
     return lines.join('\n');
 }
@@ -484,7 +535,6 @@ async function callSummarizer(storyTxt, contextStr) {
     const snapshot = isDefaultMode ? snapshotPromptToggles() : null;
     if (isDefaultMode) disableAllPromptToggles();
 
-    // Create abort controller for this summarization call
     currentAbortController = new AbortController();
     const { signal } = currentAbortController;
 
@@ -492,7 +542,6 @@ async function callSummarizer(storyTxt, contextStr) {
 
     try {
         for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
-            // Check if aborted before each attempt
             if (signal.aborted) {
                 log('Summarization aborted by user.');
                 toastr.warning('Summarization aborted.', 'Summaryception', { timeOut: 3000 });
@@ -504,8 +553,7 @@ async function callSummarizer(storyTxt, contextStr) {
                     log(`Retry attempt ${attempt}/${RETRY_CONFIG.maxRetries}`);
                 }
 
-                // Race the request against a timeout and the abort signal
-                const timeoutMs = 120000; // 2 minutes
+                const timeoutMs = 120000;
                 const result = await Promise.race([
                     sendSummarizerRequest(s, s.summarizerSystemPrompt, prompt),
                                                   new Promise((_, reject) => {
@@ -531,7 +579,6 @@ async function callSummarizer(storyTxt, contextStr) {
             } catch (err) {
                 lastError = err;
 
-                // Abort is never retryable
                 if (signal.aborted || err.message === 'Aborted by user') {
                     log('Summarization aborted by user.');
                     toastr.warning('Summarization aborted.', 'Summaryception', { timeOut: 3000 });
@@ -570,12 +617,11 @@ async function callSummarizer(storyTxt, contextStr) {
                                { timeOut: delay }
                 );
 
-                // Abortable sleep
-                await new Promise((resolve, reject) => {
+                await new Promise((resolve) => {
                     const timer = setTimeout(resolve, delay);
                     signal.addEventListener('abort', () => {
                         clearTimeout(timer);
-                        resolve(); // resolve, not reject — the abort check at loop top handles it
+                        resolve();
                     });
                 });
             }
@@ -648,16 +694,11 @@ async function maybeSummarizeTurns() {
     // ─── Normal operation: single batch ──────────────────────────
     const success = await summarizeOneBatch(visibleTurns);
 
-    // If the batch failed, STOP. Don't recursively retry the same failing batch.
-    // The next incoming message will trigger a fresh attempt. This prevents the
-    // infinite loop: maybeSummarizeTurns → summarizeOneBatch(fail) → overflow
-    // still true → maybeSummarizeTurns → summarizeOneBatch(fail) → ...
     if (!success) {
         log('Batch failed, stopping summarization cycle to avoid retry loop.');
         return;
     }
 
-    // Check if there's still a small overflow (not a backlog)
     const remaining = getAssistantTurns(chat).filter(t => !chat[t.index].extra?.sc_ghosted);
     if (remaining.length > s.verbatimTurns && remaining.length - s.verbatimTurns <= backlogThreshold) {
         await maybeSummarizeTurns();
@@ -957,7 +998,6 @@ async function maybePromoteLayer(layerIndex) {
     if (!store.layers[layerIndex + 1]) store.layers[layerIndex + 1] = [];
     const destLayer = store.layers[layerIndex + 1];
 
-    // Seed promotion: if destination is empty, move oldest snippet directly
     if (destLayer.length === 0) {
         const seed = layer.shift();
         seed.promoted = true;
@@ -981,7 +1021,6 @@ async function maybePromoteLayer(layerIndex) {
         return;
     }
 
-    // Normal promotion: summarize oldest N snippets
     const toMerge = layer.splice(0, s.snippetsPerPromotion);
     const storyTxt = toMerge.map(sn => sn.text).join(' ');
     const contextStr = buildFullContext(layerIndex + 1);
@@ -1025,7 +1064,6 @@ function assembleSummaryBlock() {
 
     const snippets = [];
 
-    // Deep layers first (oldest context)
     for (let i = store.layers.length - 1; i >= 1; i--) {
         const layer = store.layers[i];
         if (!layer || layer.length === 0) continue;
@@ -1034,7 +1072,6 @@ function assembleSummaryBlock() {
         }
     }
 
-    // Layer 0 last (most recent)
     if (store.layers[0] && store.layers[0].length > 0) {
         for (const sn of store.layers[0]) {
             snippets.push(sn.text);
@@ -1064,8 +1101,6 @@ function updateInjection() {
             return;
         }
 
-        // Depth counts ALL messages, not just assistant.
-        // Multiply by 2 to account for user+assistant alternation.
         const depth = s.verbatimTurns * 2;
         setExtensionPrompt(MODULE_NAME, summaryBlock, 1, depth, false, 0);
 
@@ -1147,6 +1182,7 @@ function registerSlashCommands() {
                 const store = getChatStore();
                 store.layers.length = 0;
                 store.summarizedUpTo = -1;
+                store.ghostedIndices = [];
 
                 const { chatMetadata } = SillyTavern.getContext();
                 chatMetadata[MODULE_NAME] = store;
@@ -1284,7 +1320,6 @@ function updateSnippetBrowser() {
         const sn = layer[snippetIdx];
         const textEl = $(this);
 
-        // Replace text with a textarea
         const textarea = $('<textarea class="sc-snippet-edit"></textarea>')
         .val(sn.text)
         .on('keydown', async function (e) {
@@ -1327,7 +1362,6 @@ function updateSnippetBrowser() {
 
         const sn = layer[snippetIdx];
 
-        // Only Layer 0 snippets have turnRange — promoted snippets can't be redone
         if (!sn.turnRange) {
             toastr.warning(
                 'Only Layer 0 (turn summary) snippets can be regenerated. Promoted meta-summaries have no source turns.',
@@ -1345,7 +1379,6 @@ function updateSnippetBrowser() {
         const [rangeStart, rangeEnd] = sn.turnRange;
         const { chat } = SillyTavern.getContext();
 
-        // Confirm
         if (!confirm(`Regenerate summary for turns ${rangeStart}–${rangeEnd}?`)) return;
 
         isSummarizing = true;
@@ -1353,7 +1386,6 @@ function updateSnippetBrowser() {
         btn.prop('disabled', true).removeClass('fa-rotate-right').addClass('fa-spinner fa-spin');
 
         try {
-            // Build passage from the original turn range
             const storyTxt = buildPassageFromRange(chat, rangeStart, rangeEnd);
 
             if (!storyTxt.trim()) {
@@ -1361,13 +1393,11 @@ function updateSnippetBrowser() {
                 return;
             }
 
-            // Build context from everything EXCEPT this snippet
             const contextParts = [];
             for (let i = store.layers.length - 1; i >= 0; i--) {
                 const l = store.layers[i];
                 if (!l) continue;
                 for (let j = 0; j < l.length; j++) {
-                    // Skip the snippet we're regenerating
                     if (i === layerIdx && j === snippetIdx) continue;
                     contextParts.push(l[j].text);
                 }
@@ -1386,7 +1416,6 @@ function updateSnippetBrowser() {
                 return;
             }
 
-            // Replace in place
             sn.text = newSummary;
             sn.timestamp = Date.now();
             sn.regenerated = true;
@@ -1411,7 +1440,6 @@ function updateSnippetBrowser() {
         if (layer) {
             layer.splice(snippetIdx, 1);
 
-            // Recalculate summarizedUpTo from remaining Layer 0 snippets
             if (store.layers[0] && store.layers[0].length > 0) {
                 const maxEnd = Math.max(...store.layers[0]
                 .filter(sn => sn.turnRange)
@@ -1497,8 +1525,6 @@ function bindUIEvents() {
         for (let i = 0; i < chat.length; i++) {
             const m = chat[i];
 
-            // Find messages that are is_system or is_hidden but shouldn't be
-            // They have real content, aren't user messages, and don't have our ghost flag
             const isStuckHidden = (m.is_system || m.is_hidden)
             && !m.is_user
             && !m.extra?.sc_ghosted
@@ -1506,14 +1532,12 @@ function bindUIEvents() {
             && m.mes.trim().length > 0;
 
             if (isStuckHidden) {
-                // Try to unhide via slash command
                 try {
                     await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
                 } catch (e) {
                     log(`Repair: failed to unhide ${i}:`, e);
                 }
 
-                // Also clear the flags directly
                 m.is_system = false;
                 delete m.is_hidden;
 
@@ -1550,15 +1574,13 @@ function bindUIEvents() {
     $('#sc_clear_memory').on('click', async function () {
         if (!confirm('Clear ALL Summaryception memory for this chat and unghost all messages?')) return;
 
-        // Unghost first
         await unghostAllMessages();
 
-        // Clear the store by modifying in place, not reassigning
         const store = getChatStore();
         store.layers.length = 0;
         store.summarizedUpTo = -1;
+        store.ghostedIndices = [];
 
-        // Force save metadata
         const { chatMetadata } = SillyTavern.getContext();
         chatMetadata[MODULE_NAME] = store;
 
@@ -1652,14 +1674,12 @@ function bindUIEvents() {
                 const { chat } = SillyTavern.getContext();
                 const store = getChatStore();
 
-                // Unghost everything first
                 await unghostAllMessages();
 
-                // Load imported data
                 store.layers = data.layers;
                 store.summarizedUpTo = data.summarizedUpTo ?? -1;
+                store.ghostedIndices = data.ghostedIndices || [];
 
-                // Re-ghost up to imported pointer
                 if (store.summarizedUpTo >= 0) {
                     await ghostMessagesUpTo(store.summarizedUpTo);
                 }
@@ -1771,6 +1791,16 @@ function initConnectionUI() {
         openaiModel.value = s().openaiModel || '';
         openaiModel.addEventListener('input', () => {
             s().openaiModel = openaiModel.value.trim();
+            save();
+        });
+    }
+
+    // ── OpenAI Max Tokens ──
+    const openaiMaxTokens = document.getElementById('summaryception_openai_max_tokens');
+    if (openaiMaxTokens) {
+        openaiMaxTokens.value = s().openaiMaxTokens || 0;
+        openaiMaxTokens.addEventListener('input', () => {
+            s().openaiMaxTokens = parseInt(openaiMaxTokens.value, 10) || 0;
             save();
         });
     }
@@ -1968,6 +1998,6 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     eventSource.on(event_types.APP_READY, () => {
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v5.1.7 loaded. Connection Settings available');
+        console.log(LOG_PREFIX, 'v5.2.0 loaded. Connection Settings available');
     });
 })();

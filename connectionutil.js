@@ -5,7 +5,7 @@
  *   - default:  SillyTavern's generateRaw() (active connection)
  *   - profile:  ST Connection Profile via ConnectionManagerRequestService
  *   - ollama:   Ollama instance (via ST CORS proxy to avoid browser CORS issues)
- *   - openai:   OpenAI-compatible endpoint (via ST CORS proxy)
+ *   - openai:   OpenAI-compatible endpoint (via ST CORS proxy, streaming supported)
  *
  * CORS Note: Ollama and OpenAI modes route through ST's /cors/ proxy endpoint
  * to avoid browser CORS restrictions. Requires enableCorsProxy: true in config.yaml
@@ -39,15 +39,12 @@ export { ConnectionError };
 
 /**
  * Wrap a URL through SillyTavern's CORS proxy if needed.
- * Falls back to direct URL if CORS proxy is unavailable.
  * @param {string} url - The target URL
  * @param {boolean} useProxy - Whether to attempt proxying
  * @returns {string} - The (possibly proxied) URL
  */
 function proxiedUrl(url, useProxy = true) {
     if (!useProxy) return url;
-    // ST's CORS proxy endpoint: /cors/<target_url>
-    // This routes the request through ST's Node.js server, bypassing browser CORS.
     return `/cors/${url}`;
 }
 
@@ -85,7 +82,7 @@ export async function sendSummarizerRequest(settings, systemPrompt, userPrompt) 
         case 'ollama':
             return await sendViaOllama(settings.ollamaUrl, settings.ollamaModel, systemPrompt, userPrompt);
         case 'openai':
-            return await sendViaOpenAI(settings.openaiUrl, settings.openaiKey, settings.openaiModel, systemPrompt, userPrompt);
+            return await sendViaOpenAI(settings.openaiUrl, settings.openaiKey, settings.openaiModel, systemPrompt, userPrompt, settings.openaiMaxTokens);
         case 'default':
         default:
             return await sendViaDefault(systemPrompt, userPrompt);
@@ -163,10 +160,8 @@ async function sendViaProfile(profileId, systemPrompt, userPrompt) {
             ignoreInstruct: true,
         });
 
-        // Debug: log what we actually got back
         console.log('[Summaryception][Connection] Profile sendRequest returned:', typeof raw, raw);
 
-        // Handle various possible return types
         let result;
         if (typeof raw === 'string') {
             result = raw;
@@ -179,7 +174,6 @@ async function sendViaProfile(profileId, systemPrompt, userPrompt) {
         } else if (raw?.data) {
             result = typeof raw.data === 'string' ? raw.data : JSON.stringify(raw.data);
         } else if (raw && typeof raw === 'object') {
-            // Last resort: try to find any string value
             const str = JSON.stringify(raw);
             console.warn('[Summaryception][Connection] Unexpected return type from sendRequest:', str.substring(0, 500));
             throw new ConnectionError(
@@ -205,7 +199,6 @@ async function sendViaProfile(profileId, systemPrompt, userPrompt) {
         return result;
 
     } catch (error) {
-        // If it's already a ConnectionError we threw above, re-throw as-is
         if (error instanceof ConnectionError) throw error;
 
         const msg = error?.message || String(error);
@@ -228,7 +221,6 @@ async function sendViaProfile(profileId, systemPrompt, userPrompt) {
             );
         }
 
-        // Unknown errors from the ST service — could be transient, allow retry
         throw new ConnectionError(
             `Connection Profile request failed: ${msg}`,
             { retryable: true, status: status }
@@ -259,7 +251,6 @@ async function sendViaOllama(url, model, systemPrompt, userPrompt) {
     const baseUrl = url.replace(/\/+$/, '');
     const targetUrl = `${baseUrl}/api/chat`;
 
-    // Try CORS proxy first, fall back to direct
     let response;
     try {
         response = await fetch(proxiedUrl(targetUrl), {
@@ -281,7 +272,6 @@ async function sendViaOllama(url, model, systemPrompt, userPrompt) {
             }),
         });
     } catch (proxyError) {
-        // If CORS proxy failed, try direct (might work if Ollama has CORS configured)
         console.warn(`${MODULE_NAME} CORS proxy failed, trying direct:`, proxyError.message);
         try {
             response = await fetch(targetUrl, {
@@ -376,14 +366,17 @@ export async function fetchOllamaModels(url) {
     return data.models;
 }
 
-// ─── Mode 4: OpenAI Compatible ──────────────────────────────────────
+// ─── Mode 4: OpenAI Compatible (Streaming) ──────────────────────────
 
 /**
- * Send a request to any OpenAI-compatible endpoint.
+ * Send a request to any OpenAI-compatible endpoint using streaming.
+ * Streaming avoids the non-streaming token ceiling (4096 on many providers)
+ * and allows reasoning models to complete their full thinking + output.
+ *
  * Routes through ST's CORS proxy for local endpoints.
- * Cloud endpoints (detected by URL) skip the proxy since they have CORS headers.
+ * Cloud endpoints skip the proxy since they have CORS headers.
  */
-async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt) {
+async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt, maxTokens) {
     if (!url) {
         throw new ConnectionError(
             'OpenAI Compatible URL is not configured. Please set it in Summaryception settings.',
@@ -409,9 +402,7 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt) {
         }
     }
 
-    // Decide whether to use CORS proxy:
-    // - Local endpoints (localhost, 127.0.0.1, 192.168.x.x) → use proxy
-    // - Cloud endpoints (openrouter.ai, api.openai.com, etc.) → skip proxy (they have CORS)
+    // Decide whether to use CORS proxy
     const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?/i.test(endpoint);
 
     const headers = {
@@ -421,19 +412,28 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt) {
         headers['Authorization'] = `Bearer ${apiKey}`;
     }
 
-    const body = JSON.stringify({
+    // Use maxTokens from settings, default to 0 (no limit / provider default)
+    const tokenLimit = maxTokens && maxTokens > 0 ? maxTokens : undefined;
+
+    const requestBody = {
         model: model,
         messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
         ],
         temperature: 0.8,
-        max_tokens: 800,
-    });
+        stream: true,
+    };
+
+    // Only include max_tokens if explicitly set
+    if (tokenLimit) {
+        requestBody.max_tokens = tokenLimit;
+    }
+
+    const body = JSON.stringify(requestBody);
 
     let response;
     if (isLocal) {
-        // Local endpoint: try CORS proxy, fall back to direct
         try {
             response = await fetch(proxiedUrl(endpoint), {
                 method: 'POST',
@@ -458,7 +458,6 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt) {
             }
         }
     } else {
-        // Cloud endpoint: direct fetch (should have CORS headers)
         try {
             response = await fetch(endpoint, {
                 method: 'POST',
@@ -493,16 +492,55 @@ async function sendViaOpenAI(url, apiKey, model, systemPrompt, userPrompt) {
         );
     }
 
-    const data = await response.json();
+    // ─── Stream reading ──────────────────────────────────────────
+    // Read SSE chunks and assemble the full response content.
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullContent = '';
+    let buffer = '';
 
-    if (!data?.choices?.[0]?.message?.content) {
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            // Process complete SSE lines
+            const lines = buffer.split('\n');
+            // Keep the last potentially incomplete line in the buffer
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || !trimmed.startsWith('data:')) continue;
+
+                const data = trimmed.slice(5).trim();
+                if (data === '[DONE]') continue;
+
+                try {
+                    const parsed = JSON.parse(data);
+                    const delta = parsed.choices?.[0]?.delta?.content;
+                    if (delta) {
+                        fullContent += delta;
+                    }
+                } catch (e) {
+                    // Skip unparseable chunks (comments, keep-alive, etc.)
+                }
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+
+    if (!fullContent.trim()) {
         throw new ConnectionError(
-            'OpenAI Compatible endpoint returned an empty or invalid response.',
-            { retryable: true }
+            'OpenAI Compatible endpoint returned an empty response (streaming).',
+                                  { retryable: true }
         );
     }
 
-    return data.choices[0].message.content;
+    return fullContent;
 }
 
 /**
@@ -519,7 +557,8 @@ export async function testOpenAIConnection(url, apiKey, model) {
             apiKey,
             model || 'test',
             'You are a test assistant.',
-            'Respond with exactly: CONNECTION_OK'
+            'Respond with exactly: CONNECTION_OK',
+            100 // small token limit for test
         );
         return {
             success: true,
