@@ -183,7 +183,7 @@ async function repairGhostingForRange(endIndex) {
     for (let i = 0; i <= upperBound; i++) {
         const msg = chat[i];
         if (!msg) continue;
-        if (msg.is_system && !msg.extra?.sc_ghosted) continue;
+        if (msg.is_system) continue;
         if (msg.extra?.sc_ghosted) continue;
         if (msg.is_hidden) continue;
 
@@ -956,7 +956,7 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
         return true;
     } catch (e) {
         console.error(LOG_PREFIX, 'Unexpected error in summarizeOneBatchFromTurns:', e);
-        trace('summarizeOneBatchFromTurns exception', e?.message || e);
+        trace('summarizeOneBatchFromTurns exception', { error: e?.message || String(e) });
         return false;
     }
 }
